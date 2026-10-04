@@ -1,0 +1,2130 @@
+/*
+	Transfer morphs & character preset from source to target using precomputed barycentric coordinates
+
+	Steps :
+	- Initialization :
+		- check installed figures to build the list of available source & target figures
+		- load source & target figures in the scene on 'Initialize' button click
+		- display available source morphs with filtering options (select, include, exclude)
+		- load D-Former weights
+		- load relevant barycentric maps & set specific data
+
+	- For each selected morph / controller / character :
+		- discriminate between head & body morph based on morph region
+		- delete existing morph, as overwrite is not allowed
+		- restore & zero all figures
+		- put source in target pose
+		- apply morph on source figure
+		- rescale & translate source to normalize to target & align heads
+		- create morphs for main figure & its attachments
+		- adjust rigging to shape
+		- ERC freeze nodes properties
+		- write morph to file
+		- unload source morph deltas
+		- copy card images to destination folder if desired
+		-
+	- For each selected controller :
+		- restore target figure
+		- delete existing controller, as overwrite is not allowed
+		- create controller
+		- ERC Freeze
+		- write controller to file
+		- copy card images to destination folder if desired
+
+	- For each character found in all content libraries :
+		- open source file & apply transferable items to target
+		- write character to file
+		- on Windows, always duplicate icons. On other OS, duplicate icons if requested, create symlinks otherwise
+
+	Note : all morphs are processed first, then controllers, then characters
+*/
+
+try { (function(){
+
+//========================================= Global variables =========================================
+
+// Constants
+const DEBUG = false; // Used for development
+const VECTOR_RIGHT = new DzVec3(-1, 1, 1); // Used to flip a vector on the x-axis (left to right)
+const EYEBROWS_OFFSET = new DzVec3(0, 0, 0.015); // Used to slightly offset eyebrows from forehead to ensure full visibility
+
+// System
+const actionMgr = MainWindow.getActionMgr(); // DzActionMgr
+const assetIOMgr = App.getAssetIOMgr(); // DzAssetIOMgr
+const assetMgr = App.getAssetMgr(); // DzAssetMgr
+const contentMgr = App.getContentMgr(); // DzContentMgr
+const helper = new DzSceneHelper();
+
+// 'Character Transfer' content library
+const contentLibrary = contentMgr.findBaseDirectory(DzContentMgr.NativeDirs, getScriptFileName()).fullPath; // 'Character Transfer' content library
+if (contentLibrary === null) // In case script is executed outside of a content library
+{
+	ErrorMessage('Character Transfer content library not found. Check your installation');
+	return;
+}
+
+// GUI
+var transferLV; // DzListView
+var row1; // DzVGroupBox (its visibility can be toggled)
+var executeBtn; // DzButton (its visibility can be toggled)
+var srcThumbnail; // DzLabel used to display selected source figure or morph thumbnail
+
+// Store target vertices index used in main morph ([String])
+var baryKeys;
+
+// Store eyes & mouth bones
+const eyeBones = []; // Target figure eyes bones ([DzNode])
+const mouthBones = []; // Figure mouth bones ([DzNode]) for target figures with separate Mouth figure (G9 currently)
+
+// Target skeleton pruning
+var boneNames = []; // All target figure bone names
+var neck; // Target root neck bone (DzNode)
+var headNames = []; // Neck + Head bones name
+
+// Source, target & attachments figures & geometry
+var src, tgt, tgtEyes, tgtEyelashes, tgtMouth, tgtTear, tgtEyebrows, srcEyes, srcEyelashes, srcMouth, srcTear, srcEyebrows; // DzSkeleton figures
+var srcBase, srcMorphed, tgtBase, tgtMorphed, eyelashesBase, tearBase, eyebrowsBase; // Base & morphed geometries (DzVertexMesh)
+var srcName, tgtName; // Cache target & source names, as we use them frequently (String)
+var rootTongue; // Mouth root tongue bone (DzNode)
+
+// Source morphs, controllers & character presets
+var srcMorphs = []; // Source morphs [DzFloatProperty]
+var srcCtrls = []; // Source controllers [DzFloatProperty]
+var srcCharacters = []; // Source characters found in Content Libraries
+
+// Splitting variables
+var dformPath; // Head split D-Former relative path (String)
+const weights = {}; // D-Former weights {vertex index : weight in range [0;1]}
+var refVertex = -1; // D-Former reference vertex index (int)
+const headVertices = []; // Store D-Former vertices index for filtering morphed vertices in head splits
+var isHead; // Whether current morph is a head or body one
+
+// Barycentric maps
+var mainMap, eyeSocketsGlobesMap, caruncleMap, eyelashesMap, eyebrowsMap, tearMap;
+
+// Reference vertices pairs for scaling purpose : [[Left, Right], [Top, Bottom], [Front, Back]]
+var eyeSocketsRefVertsG8; // G8 target eye sockets
+var tearRefVerts; // Target tear
+var mouthRefVerts; // Mouth cavity
+
+// Reference vertex indices for scaling purpose : [top, bottom, front]
+var eyesVerticesSrc; // Source left eye
+var eyesVerticesTgt; // Target left eye
+
+// Other reference vertices
+var tgtMouthVerts; // Target mouth upper-front 2 vertices (aperture & above)
+var eyesBackVertsG8F; // G8F back of eyes vertices
+var eyesBackVertsG8M; // G8M back of eyes vertices
+
+// Stored vertices index
+const tgtEyesVerts = new Set(); // Target eyes vertices when source eyes are an attachment (currently G9 as source)
+const eyeSocketsVertsG8 = new Set(); // G8 target eye sockets vertices
+const tgtJawVerts = new Set(); // G8 target complete mouth vertices from 'Mouth' & 'Teeth' surfaces
+const mouthCavityVerts = new Set(); // G9 target mouth cavity vertices
+
+// Pose controller used to put source in target pose
+var srcPose;
+
+// Temporarily store target transfered morphs (main & attachments) [DzFloatProperty]
+var morphs = [];
+
+//================= Helper Functions ==================
+
+function File2Path(str) { return str.match(/(.*)[\/\\]/)[1]||''; } // Return path with filename and extension stripped
+
+function FullPathChecked(str) { return str.isEmpty() ? '' : contentMgr.getAbsolutePath(DzContentMgr.NativeDirs, str); } // Return full path from relative path if path exists, empty string otherwise
+
+function ToUse(prop) { return helper.isNodeProperty(prop) ? prop : prop.getOwner(); } // Return property to use (morph or controller
+
+function ConvertToTarget(srcPath) { return srcPath.replace(src.getLabel().replace('.1', ''), tgt.getLabel().replace('.1', '')); } // Convert source path to target path ('.1' is for G8.1)
+
+function GetVendorProduct(path) { return [path.split('/').slice(-3, -2).join(), path.split('/').slice(-2, -1).join()]; } // Infer vendor & product names from source file path
+
+function GetMorphPath(vendor, product) { return '%1/%2/Morphs/%3/%4'.arg(contentLibrary).arg(File2Path(tgt.assetUri.filePath.substring(1))).arg(vendor).arg(product); } // Get output morph path
+
+//================= Get available (installed) figures ===================
+
+// All existing figures paths
+var installed = {
+	'Genesis' : '/People/Genesis/Genesis.duf',
+	'Genesis 2 Female' : '/People/Genesis 2 Female/Genesis 2 Base Female.duf',
+	'Genesis 2 Male' : '/People/Genesis 2 Male/Genesis 2 Base Male.duf',
+	'Genesis 3 Female' : '/People/Genesis 3 Female/Genesis 3 Female.duf',
+	'Genesis 3 Male' : '/People/Genesis 3 Male/Genesis 3 Male.duf',
+	'Genesis 8 Female' : '/People/Genesis 8 Female/Genesis 8 Basic Female.duf',
+	'Genesis 8 Male' : '/People/Genesis 8 Male/Genesis 8 Basic Male.duf',
+	'Genesis 8.1 Female' : '/People/Genesis 8 Female/Genesis 8.1 Basic Female.duf',
+	'Genesis 8.1 Male' : '/People/Genesis 8 Male/Genesis 8.1 Basic Male.duf',
+	'Genesis 9' : '/People/Genesis 9/Genesis 9.duf'
+//	'Genesis 9 Anime Feminine' : '/People/Genesis 9 Toon/Genesis 9 Base Anime Feminine.duf', // TODO: investigate later
+//	'Genesis 9 Anime Masculine' : '/People/Genesis 9 Toon/Genesis 9 Base Anime Masculine.duf' // TODO: investigate later
+};
+
+// Filter out uninstalled figures
+installed = Object.keys(installed).reduce(function(r, k)
+{
+	if (!FullPathChecked(installed[k]).isEmpty())
+		r[k] = installed[k];
+	return r;
+}, {});
+
+const forbiddenTargets = ['Genesis', 'Genesis 2 Female', 'Genesis 2 Male', 'Genesis 3 Female', 'Genesis 3 Male']; // We only support G8, G8.1 & G9 targets
+
+//================== GUI ===================
+
+//============
+// Window
+//============
+const window = new DzBasicDialog; window.caption = 'Character Transfer v1'; window.toolTip = ''; window.width = 300;
+window.showHelpButton(false); // Hide "What's This" button
+window.showAcceptButton(false);
+const layout = new DzBoxLayout(window);
+
+// Main box
+const wContainer = new DzVGroupBox(window);
+wContainer.flat = true;
+window.insertWidget(0, wContainer);
+
+//==================
+// Display 2 tabs
+//==================
+const tabs = new DzTabWidget(wContainer);
+//layout.addWidget(tabs);
+const tab0 = new DzVGroupBox(tabs); tabs.addTab(tab0, 'Transfer');
+const tab1 = new DzVGroupBox(tabs); tabs.addTab(tab1, 'Log Report');
+
+const mainBox = new DzVGroupBox(tab0); mainBox.insideMargin = 0; mainBox.insideSpacing = 0;
+window.insertWidget(0, mainBox);
+
+//============
+// Grid layout
+//============
+const gridLayout = new DzGridLayout(tab0);
+gridLayout.insideMargin = 0;
+gridLayout.spacing = 1;
+
+var aMorphsArray = []; // Source figure Morphs ([DzProperty])
+var transferLVitems = []; // 'Transfer List' items (Label, Type, Path, Idx)
+
+//============
+// Helper functions
+//============
+function Button(parent, txt = '', tip = '')
+{
+	const btn = new DzPushButton(parent);
+	if (parent === window)
+		window.addButton(btn);
+	if (txt) btn.text = txt;
+	if (tip) btn.toolTip = tip;
+	return btn;
+}
+
+function CheckBox(parent, txt, checked, tip)
+{
+	const box = new DzCheckBox(parent);
+	box.text = txt;
+	box.checked = checked;
+	if (tip) box.toolTip = tip;
+	return box;
+}
+
+function Label(parent, txt, width)
+{
+	const lab = new DzLabel(parent);
+	lab.text = txt;
+	if (width) lab.setFixedWidth(width);
+	return lab;
+}
+
+function VGroupBox(parent, title = '', hide = false)
+{
+	const box = new DzVGroupBox(parent);
+	box.title = title;
+	if (hide) box.hide();
+	return box;
+}
+
+function Slider(parent, layout, row, txt, width, value, sensitivity, asPercent, editable, tip, max=10)
+{
+	const label = Label(parent, txt, null);
+	if (layout)
+		layout.addWidget(label, row, 0);
+
+	const wgt = new DzFloatSlider(parent);
+	if (layout)
+		layout.addWidget(wgt, row, 1);
+	wgt.setFixedWidth(width);
+	wgt.value = value;
+	wgt.min = 0;
+	wgt.max = max;
+	wgt.clamped = true;
+	wgt.sensitivity = sensitivity;
+	wgt.displayAsPercent = asPercent;
+	wgt.textEditable = editable;
+	wgt.toolTip = tip;
+	return wgt;
+}
+
+//============
+// Create figure selector (dropdown)
+//============
+function FigureDropDown(type, current)
+{
+	const gb = new DzVGroupBox(tab0); gb.title = type + ' Figure';
+	gridLayout.addWidget(gb, 0, type === 'Source' ? 0 : 2); // Left (0) or right (2) slot in the grid layout
+
+	// Dropdown
+	const ddn = new DzComboBox(gb);
+	ddn.toolTip = type === 'Source' ? 'Select donor figure' : 'Select receiver figure';
+	for (const key of Object.keys(installed))
+	{
+		if (type === 'Target' && forbiddenTargets.includes(key)) // Skip 'forbidden' target
+			continue;
+		ddn.addItem(key);
+	}
+
+	// Thumbnail
+	const icon = new DzLabel(gb); icon.alignment = DzWidget.AlignCenter;
+	connect(ddn, 'activated', function(idx) { icon.pixmap = new Pixmap(FullPathChecked(installed[ddn.itemText(idx)].replace('duf', 'png'))); }); // Set Source/Target thumbnail when selection changes
+
+	if (type === 'Source')
+		srcThumbnail = icon;
+
+	// Set default selection (mostly used for development)
+	currentText = ddn.findText(current) >= 0 ? current : ddn.currentText; // If user-defined default selection doesn't exist, use currently selected item in the ComboBox
+	ddn.currentText = currentText;
+	icon.pixmap = new Pixmap(FullPathChecked(installed[currentText].replace('duf', 'png')));
+
+	return ddn;
+}
+
+//============
+// 'Source' dropdown
+//============
+const srcCombo = FigureDropDown('Source', 'Genesis');
+
+//=============
+// 'Target' dropdown
+//=============
+const tgtCombo = FigureDropDown('Target', 'Genesis 9');
+
+//==============
+// 'Load Scene Setup' button
+//==============
+const loadBtn = Button(tab0, 'Initialize', 'Once Source & Target have been selected, load figures into scene (or use existing scene in case of rerun of the script)');
+loadBtn.setFixedHeight(135);
+gridLayout.addWidget(loadBtn, 0, 1); // Placed between Source & Target icons
+connect(loadBtn, 'clicked', LoadScene);
+
+// Load figure into scene, zero it & set Resolution & SubDivision Levels to zero
+function LoadFigure(path)
+{
+	startProgress('Load %1 Figure'.arg(path.split('/').slice(-1).join().slice(0, -4)), 1, true, true); // Steps, cancellable, show time
+
+	try
+	{
+		const uri = new DzUri(path);
+		if (!contentMgr.openUri(uri))
+			ErrorMessage('\u2620 %1 not found\nPlease reinstall figure using Daz Install Manager'.arg(path));
+
+		const node = Scene.getPrimarySelection(); // DzSkeleton
+
+		finishProgress();
+
+		return node;
+	}
+
+	catch (err) { ErrorMessage('Runtime Error: ' + err.message); }
+}
+
+// Create scene setup
+function CreateSceneSetup()
+{
+	if (MessageBox.information('\nCreating Scene Setup.\n\nThis can take up to a minute', 'Creating Scene Setup', 'OK', 'Cancel') === 1) // If cancelled by user
+		return;
+
+	// Clear scene
+	Scene.clear();
+
+	for (const path of [installed[srcCombo.currentText], installed[tgtCombo.currentText]])
+		LoadFigure(path);
+
+	Scene.update();
+	return true;
+}
+
+// Get current scene or load figures into it
+function LoadScene()
+{
+	// Target must be different from Source
+	if (srcCombo.currentText === tgtCombo.currentText)
+	{
+		ErrorMessage('Target must be different from Source', 'Error : Source = Target');
+		return;
+	}
+
+	// Check current scene & rebuild if necessary
+	try { GetFigures(true); } // Perform sanity check by trying to get all figures in the scene
+	catch (e)
+	{
+		if (!CreateSceneSetup()) // Load source & target figures into new scene
+			return;
+		GetFigures(); // Get all figures in the scene
+	}
+
+	// Show 'Transfer List' block & hidden buttons
+	for (const w of [row1, executeBtn])
+		w.show();
+
+	// Load pose controller used to put source in target pose
+	if (!(srcName.startsWith('Genesis8') && tgtName.startsWith('Genesis8'))) // G8F & G8M are in same pose
+		srcPose = helper.findPropertyOnNodeByInternalName(tgtName.replace('_1', '') + 'ClonePose', src);
+
+	// Load specific maps
+	LoadMaps();
+
+	// Set D-Former weights (mandatory)
+	SetWeights(); // Set D-Former weights {vertex index : weight in range [0;1]} & reference vertex
+	if (!weights && ErrorMessage('Failed to find a valid D-Former for target figure', 'No D-Former found', 'Exit') === 0)
+		window.close();
+
+	CacheGeometry(); // Store all figures base geometries in variables
+
+	GetNeckAndHeadBones(); // Collect target head & neck bones name for skeleton pruning
+
+	// Get all source morphs & fill Transfer ListView
+	GetMorphs(); // Collect all morphs & controllers in Actor & Head regions (fill srcMorphs & srcCtrls arrays)
+	srcCharacters = []; // Flush array
+	UpdateLV(); // Fill 'Transfer List' ListView
+
+	UpdateCounter();
+	processEvents();
+}
+
+//===============
+// Init 'Transfer List' block
+//===============
+row1 = new DzVGroupBox(tab0); row1.insideMargin = 0; row1.hide(); // Hidden @ start
+gridLayout.addWidget(row1, 1, 0, 3, 3); // Full row
+
+//===============
+// 'Excluded Keywords' LineEdit
+//===============
+const excludeLabel = new DzLabel(row1); excludeLabel.text = 'Excluded Keywords'; // Label
+const excludeFilter = new DzLineEdit(row1); excludeFilter.text = 'Cranium,Size,Scale,Width,Length,Neck,Cleidomastoid,Scapula,Adams Apple,NOSE,NECK,LIPS,EYE,CHEEK'; excludeFilter.toolTip = 'As we only want full head/body morphs & controllers, these keywords, separated by a comma, are used to filter out partial morphs. You can add or remove keywords to customize the filter to your needs. These filters are case sensitive';
+connect(excludeFilter, 'editingFinished', ExcludeUpdate);
+
+// Update available morphs when exclude filter has been modified
+function ExcludeUpdate()
+{
+	// Store selection before updating morphs
+	var labels = []; // Checked labels
+	for (const item of transferLV.getItems(DzListView.Checked))
+		labels.push(item.text(0));
+
+	// Update morphs list & ListView
+	GetMorphs();
+	UpdateLV();
+
+	// Restore selection for remaining morphs
+	for (const label of labels)
+	{
+		const item = transferLV.findItem(label, 0);
+		if (item)
+			item.on = true;
+	}
+
+	// Update selection counter
+	UpdateCounter();
+}
+
+//===============
+// 'Search filter'
+//===============
+const searchFilter = new DzLineEdit(row1); searchFilter.placeholderText = 'Search filter (on Label, insensitive to case)';
+connect(searchFilter, 'textChanged', FilterMorphsList)
+
+// Update available morphs when search filter has been modified
+function FilterMorphsList(filter)
+{
+	if (filter.isEmpty()) // Restore full visibility
+	{
+		for (var i = 0; i < aMorphsArray.length; i++)
+			transferLVitems[i].visible = true;
+	}
+	else // Update show/hide
+	{
+		var regxString = new RegExp(filter.toLowerCase(), 'm'); // Insensitive case search
+		for (var i = 0; i < aMorphsArray.length; i++)
+			transferLVitems[i].visible = aMorphsArray[i].getLabel().toLowerCase().match(regxString);
+	}
+}
+
+//===============
+// 'Transfer List'
+//===============
+const wMorphsListLab0 = new DzLabel(row1);
+transferLV = new DzListView(row1);
+const items = ['Label', 'Type', 'Path', 'Idx'];
+
+for (var i = 0; i < items.length; i++)
+{
+	transferLV.addColumn(items[i]);
+	transferLV.setColumnWidthMode(i, DzListView.Maximum);
+}
+
+transferLV.hideColumn(3); // Hide Idx (used internally to link checked items to morphs array)
+connect(transferLV, 'currentChanged', ItemChanged);
+
+ // On item change, update selected/total morphs counter & display morph/controller card image
+function ItemChanged(item)
+{
+	UpdateCounter();
+	const pres = aMorphsArray[item.id].getPresentation();
+	const icon = pres.iconLarge || pres.iconSmall;
+	if (icon !== null)
+		srcThumbnail.pixmap = new Pixmap(FullPathChecked(icon));
+}
+
+// Update transfer ListView
+function UpdateLV()
+{
+	transferLV.clear();
+
+	for (var i = 0; i < aMorphsArray.length; i++)
+	{
+		const morph = aMorphsArray[i]; // DzProperty
+		transferLVitems[i] = new DzCheckListItem(transferLV, DzCheckListItem.CheckBox, i);
+		transferLVitems[i].setText(0, morph.getLabel()); // Label
+		transferLVitems[i].setText(1, srcMorphs.includes(morph) ? (morph.getPath().startsWith('/Actor/Head') ? 'Head' : 'Body') : 'Ctrl'); // Type
+		transferLVitems[i].setText(2, morph.getPath().slice(1)); // Path with first slash stripped
+		transferLVitems[i].setText(3, i); // Idx
+		transferLVitems[i].visible = true;
+		transferLVitems[i].selectable = true;
+	}
+	UpdateCounter(); // Update selected/total counter
+}
+
+//========================= Global settings & select/deselect row ========================
+
+const row3 = new DzHGroupBox(row1); row3.insideMargin = 1;
+
+//============
+// 'Duplicate cards & icons' checkbox
+//============
+const dupliCards = CheckBox(row3, 'Duplicate Images', false, 'Whether to duplicate source images to target : depends whether you intend to share the morphs (duplication required) or use them for yourself (duplication useless)');
+
+//==================
+// 'Compress' checkbox
+//==================
+const compress = CheckBox(row3, 'Compress Files', true, 'Whether to compress output dsf morph & character files');
+
+//==================
+// 'Create Characters' checkbox
+//==================
+const doCharacters = CheckBox(row3, 'Create Characters', false, 'Whether to transfer character presets found in the Characters folder of source figure');
+
+//==============
+// 'Select All' button
+//==============
+const selectAllBtn = Button(row3, 'Select All', 'Check all morphs');
+connect(selectAllBtn, 'clicked', SelectAll);
+
+// Check unchecked items
+function SelectAll()
+{
+	for (const item of transferLV.getItems(DzListView.NotChecked))
+		item.on = true;
+	UpdateCounter();
+}
+
+//==============
+// 'Deselect All' button
+//==============
+const deselectAllBtn = Button(row3, 'Deselect All', 'Uncheck all morphs');
+connect(deselectAllBtn, 'clicked', DeselectAll);
+
+// Uncheck checked items
+function DeselectAll()
+{
+	for (const item of transferLV.getItems(DzListView.Checked))
+		item.on = false;
+	UpdateCounter();
+}
+
+// Update checked counter
+function UpdateCounter()
+{
+	wMorphsListLab0.text = 'Available Character Morphs & Controllers  (%1 / %2)'.arg(transferLV.getItems(DzListView.Checked).length).arg(transferLV.childCount);
+}
+
+//================================== Row 4 - Morph Slider ================================
+
+const row4 = VGroupBox(tab0, 'Morph Slider (for selected morph in the list)', true); // Hidden @ start (enabled when morphs have been created)
+gridLayout.addWidget(row4, 4, 0, 1, 3);
+const morphSlider = Slider(row4, null, 0, '', 200, 0, 0.1, true, false, '', 1);
+connect(morphSlider, 'valueChanged', TestMorph); // Sync morph with slider
+connect(morphSlider, 'editEnd', function() { morphSlider.value = 0; }); // Reset on release
+
+// Apply selected morph using slider
+function TestMorph(value)
+{
+	// Get selected checked item
+	const item = transferLV.selectedItem();
+	if (!item || !item.on)
+		return;
+
+	// Apply morph value
+	const morph = helper.findPropertyOnNodeByInternalName(ToUse(aMorphsArray[item.text(3)]).name, tgt);
+	if (morph)
+		morph.setValue(value);
+}
+
+//================================= Shared bottom buttons =======================================
+
+//==============
+// 'Execute' button
+//==============
+executeBtn = Button(window, 'Execute', ''); executeBtn.hide(); // Hidden @ start
+connect(executeBtn, 'clicked', MainFunction);
+
+//==============
+// 'Show Log' button
+//==============
+const logBtn = Button(window, 'Show Log', 'Open Studio log file (equivalent to Help > Troobleshooting > View Log File... from menu');
+connect(logBtn, 'clicked', function() { trigger_action('DzLogFileAction'); }); // 'Show Log' button
+
+//============
+// 'Home' button
+//============
+const gitUrl = 'https://github.com/Mike3D/Character-Transfer-for-DAZ-Studio';
+const homeBtn = new DzPushButton(window); window.addButton(homeBtn); homeBtn.text = 'Home'; homeBtn.AlignLeft; homeBtn.toolTip = gitUrl;
+connect(homeBtn, 'clicked', function() { App.showURL(gitUrl); });
+
+//==================================  Tab #2 'Log Report'  =================================
+
+const groupbox6 = VGroupBox(tab1, 'Log Report');
+const logBox = new DzListBox(groupbox6);
+function Report(txt) { logBox.insertItem(txt); } // Convenient shortcut for logging to 'Log Report' tab
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Collect source character presets (file path) in all content directories base path (other than 'Character Transfer')
+function GetCharacters()
+{
+	for (var i = 0; i < contentMgr.getNumContentDirectories(); i++)
+	{
+		const directory = contentMgr.getContentDirectoryPath(i);
+
+		// Skip 'Character Transfer' library
+		if (directory === contentLibrary)
+			continue;
+
+		var path = '%1/People/%2/Characters'.arg(directory).arg(src.getLabel().replace('.1', '')); // '.1' deletion is for G8.1
+		var dir = new DzDir(path);
+
+		if (!dir.exists())
+			continue;
+
+		// Get all duf files (recursively)
+		var files = dir.getFilesFromDir(['*.duf'], true);
+
+		for (const fileName of files)
+		{
+			// Skip (most) materials
+			if (fileName.includes('Materials'))
+				continue;
+
+			// Open file
+			var file = new DzGZFile(fileName); // Open with DzGZFile, which is compression agnostic
+			if (file.open(DzGZFile.ReadOnly))
+			{
+				try
+				{
+					var data = JSON.parse(file.read());
+					if (data.asset_info.type === 'character')
+						srcCharacters.push(fileName);
+				}
+				catch (e) { Report('\u2620 %1 : %2'.arg(e.message).arg(fileName)); }
+				finally { file.close(); }
+			}
+			else Report('\u2620 Error while opening ' + file.errorString());
+		}
+	}
+}
+
+// Median of values in array (arr)
+function Median(arr)
+{
+    const sorted = arr.sort((a, b) => a - b);
+    const len = sorted.length;
+    const mid = Math.floor(len / 2);
+
+    return len % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+// Median of 2 DzVec3 vectors in array (vecs)
+function VectorsMedian(vecs) { return new DzVec3(Median(vecs.map(v => v.x)), Median(vecs.map(v => v.y)), Median(vecs.map(v => v.z))); }
+
+// Store source & target base geometry (DzVertexMesh)
+function CacheGeometry()
+{
+	srcBase = src.getObject().getCurrentShape().getGeometry(); // Source base geometry
+	tgtBase = tgt.getObject().getCurrentShape().getGeometry(); // Target base geometry
+
+	// Target attachments
+	if (tgtEyebrows)
+		eyebrowsBase = tgtEyebrows.getObject().getCurrentShape().getGeometry(); // Eyebrows base geometry
+
+	if (tgtTear)
+		tearBase = tgtTear.getObject().getCurrentShape().getGeometry(); // Tear base geometry
+
+	if (tgtEyelashes)
+		eyelashesBase = tgtEyelashes.getObject().getCurrentShape().getGeometry(); // Eyelashes base geometry
+}
+
+// On fatal error, spawn MessageBox & terminate current task
+function ErrorMessage(txt, title = 'Fatal Error', btn = 'Exit')
+{
+	if (progressIsActive())
+		finishProgress();
+	return MessageBox.critical('\u2620 ' + txt, '\u2620 ' + title, btn);
+}
+
+// Read map from JSON file
+function GetFileContent(path)
+{
+	const file = new DzGZFile(path); // Open with DzGZFile, which is compression agnostic
+
+	if (!file.exists())
+	{
+		ErrorMessage('Error while loading file %1 :file not found'.arg(path));
+		return;
+	}
+
+	if (file.open(DzGZFile.ReadOnly))
+	{
+		try { return JSON.parse(file.read()); }
+		catch (e) { ErrorMessage('Error while loading file %1 : %2'.arg(path).arg(e.message)); }
+		finally { file.close(); }
+	}
+	else ErrorMessage('Error while loading file %1'.arg(path));
+}
+
+// Convert barycentric coords to 3D position
+function BaryTo3D(source, v1, v2, v3, u, v, w)
+{
+	const X = source.getVertex(v1).multiply(new DzVec3(u, u, u));
+	const Y = source.getVertex(v2).multiply(new DzVec3(v, v, v));
+	const Z = source.getVertex(v3).multiply(new DzVec3(w, w, w));
+	return X.add(Y).add(Z);
+}
+
+// Apply barycentric map to vertices
+function ApplyBaryMap(baryMap, source, target, dist = false) // Map to use, source geometry, target geometry, whether distance is mapped
+{
+	for (var [idx, data] of Object.entries(baryMap))
+	{
+		// Check if we've already processed this vertex
+		if (baryKeys && target === tgtMorphed && baryKeys.includes(idx))
+			continue;
+
+		idx = Number(idx);
+
+		// Skip 'unmorphed' vertices
+		if (isHead && target === tgtMorphed && !headVertices.includes(idx))
+			continue;
+
+		// Unpack data
+		var v1, v2, v3, u, v, w, x, y, z;
+		if (dist)
+			[v1, v2, v3, u, v, w, x, y, z] = data; // Unpack source virtual triangle vertices index (v1, v2, v3), barycentric coords (u, v, w) & distance to triangle (x, y, z)
+		else
+			[v1, v2, v3, u, v, w] = data; // Unpack source triangle vertices index (v1, v2, v3) & barycentric coords (u, v, w)
+
+		// Set target vertex coords (DzVec3)
+		var coords = BaryTo3D(source, v1, v2, v3, u, v, w);
+
+		// Slightly offset eyebrows from forehead to ensure full visibility
+		if (baryMap === eyebrowsMap)
+			coords = coords.add(EYEBROWS_OFFSET);
+
+		target.setVertex(idx, dist ? coords.add(new DzVec3(x, y, z)) : coords);
+	}
+	return Object.keys(baryMap);
+}
+
+// Get scale factor (morphed / base) using different reference points on the same figure. Infer scale factor when morph is applied to source
+function GetScaleFactor(fig, verts, uniform = false)
+{
+	// Get figure (fig) base & morphed geometries
+	const base = fig.getObject().getCurrentShape().getGeometry(); // Base geometry (DzVertexMesh)
+	const morphed = fig.getObject().getCachedGeom(); // Morphed geometry (DzVertexMesh)
+
+	function GetFactor(pair, i)
+	{
+		if (!pair)
+			return 1;
+
+		[idx1, idx2] = pair;
+		const scale1 = Math.abs(base.getVertex(idx1)[i] - base.getVertex(idx2)[i]); // Base length
+		const scale2 = Math.abs(morphed.getVertex(idx1)[i] - morphed.getVertex(idx2)[i]); // Morphed length
+		return scale2 / scale1;
+	}
+
+	// Process each pair of vertices
+	const xyz = ['x', 'y', 'z'];
+	var scale = [];
+	verts.forEach((pair, i) => { scale.push(GetFactor(pair, xyz[i])); });
+
+	if (uniform) // Assumes only one axis has been passed
+	{
+		scale = scale.reduce((sum, val) => sum + val, 0) - 2; // Sum = passed axis - 2 axis set to 1
+		return new DzVec3(scale, scale, scale);
+	}
+
+	return new DzVec3(scale);
+}
+
+// Execute DzAction for supplied class name
+function trigger_action(className, settings = null)
+{
+	if (!actionMgr) return;
+
+	// Find the action to perform
+	const action = actionMgr.findAction(className);
+	if (!action)
+	{
+		ErrorMessage('Action %1 could not be found'.arg(action.text));
+		return;
+	}
+
+	// If the action is disabled
+	if (!action.enabled)
+	{
+		ErrorMessage('Action %1 is currently disabled'.arg(action.text));
+		return;
+	}
+
+	// Trigger action
+	if (settings)
+		action.triggerWithSettings(settings);
+	else action.trigger();
+}
+
+// Transfer settings & presentation from source morph
+function TweakProperty(prop, srcProp, outPath)
+{
+	const settings = new DzPropertySettings();
+	srcProp.getAttributes(settings);
+	prop.setAttributes(settings);
+
+	const pres = srcProp.getPresentation();
+
+	// When duplicating image files, we need to convert presentation paths to target
+	if (dupliCards.checked)
+	{
+		const tgtPres = new DzPresentation();
+
+		// Transfer properties
+		tgtPres.autoFitBase = pres.autoFitBase;
+		tgtPres.colorA = pres.colorA;
+		tgtPres.colorB = pres.colorB;
+		tgtPres.description = pres.description;
+		tgtPres.extendedBases = pres.extendedBases;
+		tgtPres.label = pres.label;
+		tgtPres.preferredBase = pres.preferredBase;
+		tgtPres.type = pres.type;
+
+		// Convert presentation paths to target
+		const large = pres.iconLarge;
+		if (!large.isEmpty())
+			tgtPres.iconLarge = '%1/%2'.arg(outPath).arg(large.split('/').pop());
+
+		const small = pres.iconSmall;
+		if (!small.isEmpty())
+			tgtPres.iconSmall = '%1/%2'.arg(outPath).arg(small.split('/').pop());
+
+		prop.setPresentation(tgtPres);
+	}
+	else prop.setPresentation(pres); // Copy as-is
+}
+
+//=========================
+// Collect neck bone, bone names & head bone names to allow skeleton pruning when Rigging To Shape
+//=========================
+
+// Collect neck & head bones name for skeleton pruning
+function GetNeckAndHeadBones()
+{
+	const bones = tgt.getNodeChildren(true);
+	headNames = [];
+	boneNames = [];
+	neck = null;
+
+	// Find Neck bone (named differently for each generation, split starting from G3, always containing 'neck', so we search the root bone name containing 'neck')
+	for (var i = 0; i < bones.length; i++)
+	{
+		const n = bones[i].name; // Bone name
+		boneNames.push(n);
+
+		// Neck found
+		if (!neck && n.indexOf('neck') >= 0)
+		{
+			neck = bones[i];
+
+			// Get root neck when split
+			while (neck.getNodeParent().name.indexOf('neck') >= 0)
+				neck = neck.getNodeParent();
+		}
+	}
+
+	if (!neck)
+	{
+		Report('\u2620 Neck bone not found. Skeleton pruning feature disabled');
+		return;
+	}
+
+	// Get head bones name
+	const children = neck.getNodeChildren(true);
+	headNames.push(neck.name);
+
+	for (const child of children) // Iterate neck children
+		headNames.push(child.name); // Store node name
+}
+
+// Return array of bone names to exclude from Rigging To Shape (body bones for head morphs & head bones for body morphs)
+function GetBonesToExclude()
+{
+	if (neck === null)
+		return [];
+
+	return isHead ? boneNames.filter(name => !headNames.includes(name)) : headNames; // Head or head attachment morph => exclude body bones | Body morph => exclude head bones (including neck)
+}
+
+// Delete previous morph from target before creating a new one
+function RemoveMorphs(morphName)
+{
+	for (const fig of [tgt, tgtEyes, tgtEyelashes, tgtMouth, tgtTear, tgtEyebrows])
+	{
+		if (!fig)
+			continue;
+
+		const oldMorph = helper.findPropertyOnNodeByInternalName(morphName, fig);
+		if (oldMorph)
+		{
+			oldMorph.setValue(0);
+			if (!helper.helperRemoveProperty(oldMorph)) // Delete cached property
+				Report('\u2620 %1 | Failed to remove morph'.arg(morphName));
+		}
+	}
+}
+
+// Get all skeleton figures in the scene (source, target & their attachments) & setup global variables once
+function GetFigures(reRun = false)
+{
+	const figures = Scene.getSkeletonList(); // Collect skeletons ([DzSkeleton])
+	var root = []; // Root nodes ([DzSkeleton])
+
+	// Get root skeletons
+	for (const node of figures)
+	{
+		if (node.isRootNode())
+			root.push(node);
+	}
+
+	// Root figures (DzSkeleton)
+	src = root[0]; // Source figure
+	tgt = root[1]; // Target figure
+
+	srcName = src.name;
+	tgtName = tgt.name;
+
+	// Check coherence between root names & selection (only in case of a rerun of the script, when scene is not empty)
+	if (reRun)
+	{
+		if (srcName !== srcCombo.currentText.replace(/\s/g, '').replace('.', '_') || tgtName !== tgtCombo.currentText.replace(/\s/g, '').replace('.', '_')) // Underscore replacement is for G8.1
+			throw new Error(''); // Create exception for the try/catch calling this function
+	}
+
+	// Target attachment figures (DzSkeleton)
+	if (tgtName === 'Genesis9')
+	{
+		tgtEyes = tgt.findNodeChild('Genesis9Eyes');
+		tgtEyebrows = tgt.findNodeChild('G9EyebrowCards');
+		tgtMouth = tgt.findNodeChild('Genesis9Mouth');
+		tgtEyelashes = tgt.findNodeChild('Genesis9Eyelashes');
+		tgtTear = tgt.findNodeChild('Genesis9Tear');
+	}
+	else if (tgtName.startsWith('Genesis8'))
+	{
+		tgtEyelashes = tgt.findNodeChild(tgtName + 'Eyelashes'); // G8 & G8.1
+
+		if (tgtName.includes('_1')) // G8.1
+			tgtTear = tgt.findNodeChild(tgt.getLabel().split(' ').pop() + ' 8_1 Tear');
+	}
+
+	// Source attachment figures (DzSkeleton)
+	if (srcName === 'Genesis9')
+	{
+		srcEyes = src.findNodeChild('Genesis9Eyes');
+		srcEyebrows = src.findNodeChild('G9EyebrowCards');
+		srcMouth = src.findNodeChild('Genesis9Mouth');
+		srcEyelashes = src.findNodeChild('Genesis9Eyelashes');
+		srcTear = src.findNodeChild('Genesis9Tear');
+	}
+	else if (srcName.startsWith('Genesis8'))
+	{
+		srcEyelashes = src.findNodeChild(srcName + 'Eyelashes'); // G8 & G8.1
+
+		if (srcName.includes('_1')) // G8.1
+			srcTear = src.findNodeChild(src.getLabel().split(' ').pop() + ' 8_1 Tear');
+	}
+
+	// Setup reference data specific to selected source-target pair
+	SetReferenceData();
+}
+
+// Set target eyes vertices when source eyes are an attachment (currently G9 to G8)
+function SetTargetEyesVerts(eyeGroups)
+{
+	tgtBase = tgt.getObject().getCurrentShape().getGeometry(); // Target base geometry
+	for (const name of eyeGroups)
+	{
+		const fg = tgtBase.findFaceGroup(name); // DzFaceGroup
+		for (const faceIdx of fg.toVector()) // Facet index
+		{
+			const face = tgtBase.getFacet(faceIdx); // DzFacet
+			for (const vert of [face.vertIdx1, face.vertIdx2, face.vertIdx3, face.vertIdx4]) // Face vertex indices
+				tgtEyesVerts.add(vert);
+		}
+	}
+}
+
+// Set reference data specific to source-target pair
+function SetReferenceData()
+{
+	// Set G8 target attachments references
+	if (tgtName.startsWith('Genesis8'))
+	{
+		GetSurfaceVerts(tgt, ['EyeSocket'], eyeSocketsVertsG8); // Store G8 target eye sockets vertices from 'EyeSocket' surface (material) into eyeSocketsVertsG8
+
+		// Get eye bones
+		for (const name of ['lEye', 'rEye']) // G9 eye bones names
+			eyeBones.push(tgt.findNodeChild(name, true)); // G9 eye bone (DzNode)
+
+		// G8 mouth vertices
+		if (!srcName.startsWith('Genesis3')) // Note : G3 shares same geometry
+			GetSurfaceVerts(tgt, ['Mouth', 'Teeth'], tgtJawVerts); // Complete mouth vertices from 'Mouth' & 'Teeth' surfaces
+
+		// G8F & G8F.1
+		if (tgtName.replace('_1', '') === 'Genesis8Female')
+		{
+			dformPath = FullPathChecked('/People/Genesis 8 Female/Developer Kit/Genesis 8 Female HeadSplit DFormer.duf'); // Head split D-Former relative path
+			eyesBackVertsG8F = [[16346, 16550, 16304], [16349, 16548, 16307], [16375, 16546, 16340], [16364, 16547, 16327], [16361, 16549, 16324], [16080, 16555, 16023], [16083, 16553, 16026], [16117, 16551, 16071], [16102, 16552, 16052], [16099, 16554, 16049], [16281, 16539, 16244], [16284, 16537, 16247], [16295, 16536, 16260], [16269, 16538, 16227], [16266, 16540, 16224], [15969, 16544, 15919], [15972, 16542, 15922], [15987, 16541, 15941], [15953, 16543, 15896], [15950, 16545, 15893]];
+			eyesVerticesTgt = [16293, 16258, 16472]; // [top, bottom, front]
+			tgtMouthVerts = [6194, 6195]; // Mouth aperture top/bottom center
+			eyeSocketsRefVertsG8 = [[1482, 1495], [1489, 1480], null];
+		}
+
+		// G8M & G8M.1
+		else if (tgtName.replace('_1', '') === 'Genesis8Male')
+		{
+			dformPath = FullPathChecked('/People/Genesis 8 Male/Developer Kit/Genesis 8 Male HeadSplit DFormer.duf'); // Head split D-Former relative path
+			eyesBackVertsG8M = [[15908, 16383, 15851], [15911, 16381, 15854], [15945, 16379, 15899], [15930, 16380, 15880], [15927, 16382, 15877], [15797, 16372, 15747], [15800, 16370, 15750], [15815, 16369, 15769], [15781, 16371, 15724], [15778, 16373, 15721], [16174, 16378, 16132], [16177, 16376, 16135], [16203, 16374, 16168], [16192, 16375, 16155], [16189, 16377, 16152], [16109, 16367, 16072], [16112, 16365, 16075], [16123, 16364, 16088], [16097, 16366, 16055], [16094, 16368, 16052]];
+			eyesVerticesTgt = [16121, 16086, 16300]; // [top, bottom, front]
+			tgtMouthVerts = [5890, 5891]; // Mouth aperture top/bottom center
+			eyeSocketsRefVertsG8 = [[2186, 1442], [1436, 1427], null];
+		}
+
+		// G8.1 Tear width (left, right) & height (top, bottom)
+		if (tgtName === 'Genesis8_1Female')
+			tearRefVerts = [[8871, 8872], [8852, 8869], null];
+		else if (tgtName === 'Genesis8_1Male')
+			tearRefVerts = [[2212, 4506], [2193, 2210], null];
+	}
+
+	// Set G9 target attachments references
+	else if (tgtName === 'Genesis9')
+	{
+		dformPath = FullPathChecked('/People/Genesis 9/Developer Kit/G9 HeadSplit DFormer.duf'); // Head split D-Former relative path
+
+		// G9 Mouth
+		tgtMouthVerts = [2843, 2844]; // Mouth aperture top/bottom center
+		GetSurfaceVerts(tgt, ['Mouth Cavity'], mouthCavityVerts); // Store G9 target mouth cavity vertices from 'Mouth Cavity' surface (material) into mouthCavityVerts
+
+		// G9 Tear width (left, right) & height (top, bottom)
+		tearRefVerts = [[16383, 15104], [15085, 16394], null];
+
+		// Get eye bones
+		for (const name of ['l_eye', 'r_eye']) // G9 eye bones names
+			eyeBones.push(tgt.findNodeChild(name, true)); // G9 eye bone (DzNode)
+		eyesVerticesTgt = [476, 464, 837]; // [top, bottom, front]
+
+		// Get mouth bones
+		for (const name of ['upperteeth', 'lowerteeth']) // G9 mouth bones names
+			mouthBones.push(tgt.findNodeChild(name, true)); // G9 mouth bone (DzNode)
+		rootTongue = tgtMouth.findNodeChild('tongue01', true); // Mouth root tongue bone (used for parent scale inheritance)
+	}
+
+	// Set source reference vertices
+	if (srcName === 'Genesis9')
+	{
+		eyesVerticesSrc = [476, 464, 837]; // [top, bottom, front]
+		mouthRefVerts = [[17251, 5401], null, null]; // Mouth cavity
+		srcMouthVerts = [2843, 2844]; // Mouth aperture top/bottom center
+		SetTargetEyesVerts(['lEye', 'rEye']); // Set target eyes vertices from face groups when source eyes are an attachment (currently G9 to G8)
+	}
+	else if (srcName.replace('_1', '').startsWith('Genesis8Female')) // Note : G8F & G8F.1 have identical geometry
+	{
+		eyesVerticesSrc = [16293, 16258, 16472]; // [top, bottom, front]
+		mouthRefVerts = [[12146, 5698], null, null]; // Mouth cavity
+		srcMouthVerts = [6194, 6195]; // Mouth aperture top/bottom center
+	}
+	else if (srcName.replace('_1', '').startsWith('Genesis8Male')) // Note : G8M & G8M.1 have identical geometry
+	{
+		eyesVerticesSrc = [16121, 16086, 16300]; // [top, bottom, front]
+		mouthRefVerts = [[11520, 5394], null, null]; // Mouth cavity
+		srcMouthVerts = [5890, 5891]; // Mouth aperture top/bottom center
+	}
+	else if (srcName === 'Genesis3Female')
+	{
+		eyesVerticesSrc = [17140, 17094, 17299]; // [top, bottom, front]
+		mouthRefVerts = [[12898, 6062], null, null]; // Mouth cavity
+		srcMouthVerts = [6558, 6559]; // Mouth aperture top/bottom center
+	}
+	else if (srcName === 'Genesis3Male')
+	{
+		eyesVerticesSrc = [16485, 16439, 16644]; // [top, bottom, front]
+		mouthRefVerts = [[12272, 5758], null, null]; // Mouth cavity
+		srcMouthVerts = [6254, 6255]; // Mouth aperture top/bottom center
+	}
+	else if (srcName.startsWith('Genesis2')) // Note : G2F & G2M have identical reference vertices
+	{
+		eyesVerticesSrc = [9284, 9203, 9292]; // [top, bottom, front]
+		mouthRefVerts = [[12488, 1560], null, null]; // Mouth cavity
+		srcMouthVerts = [2106, 5880]; // Mouth aperture top/bottom center
+	}
+	else if (srcName === 'Genesis')
+	{
+		eyesVerticesSrc = [3409, 3393, 3501]; // [top, bottom, front]
+		mouthRefVerts = [[17553, 8382], null, null]; // Mouth cavity
+		srcMouthVerts = [3256, 8387]; // Mouth aperture top/bottom center
+	}
+}
+
+// For all figures, restore figure, zero figure & set SubDivision & Resolution Levels to zero
+function ResetFigures()
+{
+	Scene.selectAllSkeletons(true); // Select all skeleton figures ([DzSkeleton])
+
+	// Zero figures
+	trigger_action('DzRestoreFigureAction'); // Restore figure
+	trigger_action('DzZeroFigureAction', {'RunSilent' : true}); // Zero figure (silently)
+
+	for (const node of Scene.getSelectedSkeletonList()) // DzSkeleton
+	{
+		// Reset Resolution & SubDivision Levels to zero
+		const shape = node.getObject().getCurrentShape(); // DzShape
+		shape.getLODControl().setValue(0); // Resolution Level
+		shape.getSubDLevelControl().setValue(0); // SubDivision Level
+		node.update();
+
+		// Hide all figures, except target & its children
+		if (node !== tgt && node.getNodeParent() !== tgt)
+			node.setVisible(false);
+	}
+	Scene.selectAllSkeletons(false); // Clear selection
+}
+
+// Restore target figure
+function RestoreTarget(zero = false)
+{
+	tgt.select(true);
+	trigger_action('DzRestoreFigureAction'); // Restore figure
+
+	if (zero)
+		trigger_action('DzZeroFigureAction', {'RunSilent' : true}); // Zero figure (silently)
+}
+
+// Set head split D-Former weights from duf file
+function SetWeights()
+{
+	// Load Head split D-Former from file
+	const data = GetFileContent(dformPath);
+
+	// Check matching number of weights with target figure number of vertices
+	const shape = tgt.getObject().getCurrentShape(); // DzShape
+	shape.findProperty('lodlevel').setValueFromString('Base'); // Set Resolution Level to Base
+
+	const geom = shape.getGeometry();
+
+	const numVertices = geom.getNumVertices();
+	const numWeights = data.modifier_library[0].dform.influence_vertex_count;
+
+	if (numWeights !== numVertices && ErrorMessage('Invalid D-Former : number of weights (%1) != number of vertices(%2)'.arg(numWeights).arg(numVertices)) === 0)
+		window.close();
+/*
+	// Store weights in a DzWeightMap
+	weights = new DzWeightMap();
+	weights.setNumWeights(numWeights); // Note : contrary to method name & documentation, this is not influence_weights.count
+	for (const [idx, weight] of data.modifier_library[0].dform.influence_weights.values) // [[vertex idx, weight]]
+		weights.setFloatWeight(idx, weight);
+*/
+	// Store weights in a jSON object (we could also store them in a regular DzWeightMap)
+	for (const [idx, wgt] of data.modifier_library[0].dform.influence_weights.values) // [vertex idx, weight]
+	{
+		weights[idx] = wgt;
+		headVertices.push(Number(idx)); // Store vertex index for head splits
+	}
+
+	SetRefVertex(geom); // Set reference vertex
+}
+
+// Set D-Former Reference Vertex
+function SetRefVertex(geom)
+{
+	var lowestY = Number.MAX_VALUE;
+
+	Object.entries(weights).forEach( ([idx, wgt]) => // Iterate weights
+	{
+		// Reference Vertex is neither on head (weight=1) nore on body (weight=0)
+		if (wgt !== 0 && wgt !== 1)
+		{
+			const v = geom.getVertex(idx); // DzVec3 vertex coordinates
+
+			// Reference Vertex is on the central edge loop and on front
+			if (v.x === 0 && v.z > 0)
+			{
+				if (v.y < lowestY)
+				{
+					refVertex = idx;
+					lowestY = v.y;
+				}
+			}
+		}
+	});
+}
+
+// Get reference vertex morphed position
+function GetRefVertexMorphed(baryData)
+{
+	[v1, v2, v3, u, v, w] = baryData;
+	return BaryTo3D(srcMorphed, v1, v2, v3, u, v, w);
+}
+
+// Load barycentric maps
+function LoadMaps()
+{
+	// Main specific map for selected figures
+	mainMap = GetFileContent('%1/Maps/Main/%2_To_%3.json'.arg(contentLibrary).arg(srcName.replace('_1', '')).arg(tgtName.replace('_1', ''))); // Note : G8 & G8.1 share the same map (same base geometry)
+
+	// G8 target maps
+	if (tgtName.startsWith('Genesis8'))
+	{
+		eyelashesMap = GetFileContent('%1/Maps/Eyelashes/%2_To_%3.json'.arg(contentLibrary).arg(srcName).arg(tgtName)); // Note : G8 & G8.1 Eyelashes have their own map (different geometries)
+
+		if (tgtName.includes('_1') || srcName === 'Genesis9' || srcName.includes('_1')) // G8.1 Tear (note : G8 target tear is mapped with Eyelashes, except for G9 & G8.1 sources)
+			tearMap = GetFileContent('%1/Maps/Tear/%2Tear.json'.arg(contentLibrary).arg(tgtName)); // For each outer boundary tear vertex : [matching G8.1 vertex, [remaining vertices in the tear loop]]
+
+		if (!(srcName.startsWith('Genesis3') || srcName.startsWith('Genesis8'))) // G3 & G8 share same geometry
+			caruncleMap = GetFileContent('%1/Maps/Caruncle/%2Caruncle.json'.arg(contentLibrary).arg(tgtName.replace('_1', ''))); // Note : it encompasses the whole eye sockets
+	}
+
+	// G9 target maps
+	else if (tgtName === 'Genesis9')
+	{
+		eyeSocketsGlobesMap = GetFileContent('%1/Maps/EyeSocketsGlobes/Genesis9EyeSocketsGlobes.json'.arg(contentLibrary));
+		caruncleMap = GetFileContent('%1/Maps/Caruncle/Genesis9Caruncle.json'.arg(contentLibrary));
+		eyelashesMap = GetFileContent('%1/Maps/Eyelashes/%2_To_%3.json'.arg(contentLibrary).arg(srcName).arg(tgtName)); // Note : G8 & G8.1 Eyelashes have their own map (different geometries)
+		eyebrowsMap = GetFileContent('%1/Maps/Eyebrows/Genesis9EyebrowCards.json'.arg(contentLibrary));
+		tearMap = GetFileContent('%1/Maps/Tear/Genesis9Tear.json'.arg(contentLibrary)); // For each outer boundary tear vertex : [matching G9 vertex, [remaining vertices in the tear loop]]
+	}
+}
+
+// Collect all source morphs & controllers in Actor & Head regions
+function GetMorphs()
+{
+	// Flush arrays
+	srcMorphs = [];
+	srcCtrls = [];
+
+	const props = helper.getPropertiesOnNode(src);
+	const toExclude = excludeFilter.text.split(',');
+
+	for (const prop of props)
+	{
+		const region = prop.getRegion();
+
+		if (region !== null && ['Actor', 'Head'].includes(region.name)) // Actor > Full Body, Actor > Head & Actor > People
+		{
+			if (!toExclude.some(sub => prop.getLabel().includes(sub))) // Skip partial morphs
+			{
+				if (helper.isNodeProperty(prop)) // We have a controller
+				{
+					if (!prop.assetUri.toPath().startsWith(contentLibrary)) // Skip transfered morphs
+						srcCtrls.push(prop);
+				}
+				else if (!prop.getOwner().assetUri.toPath().startsWith(contentLibrary)) // We have a morph, which is not a transfer
+					srcMorphs.push(prop);
+			}
+		}
+	}
+	aMorphsArray = [...srcMorphs, ...srcCtrls].sort((a, b) => b.getLabel().localeCompare(a.getLabel())); // [DzFloatProperty] sorted on Label - TODO: include characters & shaping presets ?
+}
+
+// Apply weighted deltas on morphs (head/body & attachments) generated by Morph Loader (due to split)
+function CreateDeltas()
+{
+	const deltas = new DzMorphDeltas();
+
+	for (var i = 0; i < tgtBase.getNumVertices(); i++) // Iterate target vertices
+	{
+		// Skip eyes vertex when source eyes are attachments (currently G9 to G8)
+		if (isHead && srcName === 'Genesis9' && tgtEyesVerts.has(i))
+			continue;
+
+		var wgt = weights[i] || 0; // D-Former weight for this vertex (for body vertex, there is no weight assigned => assign 0)
+
+		if (!isHead)
+			wgt = 1 - wgt; // For body morph, weight = 1 if not weighted (body vertex) & inverse for transition (neck)
+
+		if (wgt === 0) continue; // Skip unweighted vertex
+
+		// Apply D-Former weight to delta => weighted delta
+		const delta = tgtMorphed.getVertex(i).subtract(tgtBase.getVertex(i)).multiply(new DzVec3(wgt, wgt, wgt)); // (Morphed & transformed vertex - Base vertex) * weight
+		deltas.addDelta(i, delta);
+	}
+
+	return deltas;
+}
+
+// Create morph
+function CreateMorph(node, deltas, vendor, product, outPath, morphName, srcMorph)
+{
+	const mod = new DzMorph(deltas);
+	mod.setName(morphName);
+
+	const error = node.getObject().addModifier(mod);
+	if (error.valueOf() !== 0x00000000)
+	{
+		Report('\u2620 %1  |  Error while adding morph to node : %2'.arg(morphName).arg(getErrorMessage(error)));
+		return;
+	}
+
+	const prop = mod.getValueControl(); // DzFloatProperty
+	prop.setIsClamped(true); // Use Limits
+	prop.setDisplayAsPercent(true); // As Percent
+	prop.setMinMax(0, 1);
+
+	TweakProperty(prop, srcMorph, outPath);
+	helper.setPropertyPath(prop, srcMorph.getPath()); // Set path & region - Note: must be called once property has been added to node
+	morphs.push(prop); // Store morph (waiting for batch post-processing)
+}
+
+// Create G9 Tear morph
+function CreateTearMorph(vendor, product, outPath, morphName, srcMorph)
+{
+	const scaleFactor = GetScaleFactor(tgt, tearRefVerts);
+
+	const tearMorphed = tgtTear.getObject().getCachedGeom(); // Tear base/morphed geometry (DzVertexMesh)
+
+	// Iterate tear vertices from map
+	Object.entries(tearMap).forEach(([idx, [tgtIdx, verts]]) =>
+	{
+		idx = Number(idx); // Tear vertex index on the outer edge loop
+
+		// Snap tear boundary loop to target
+		const tgtPos = tgtMorphed.getVertex(tgtIdx); // Target (G9) vertex position
+		tearMorphed.setVertex(idx, tgtPos);
+
+		// Move remaining vertices in the loop with same magnitude
+		const offset = tgtPos.subtract(tearBase.getVertex(idx).multiply(scaleFactor)); // Vector to move tear vertex to target vertex
+		for (const i of verts)
+			tearMorphed.setVertex(i, tearMorphed.getVertex(i).multiply(scaleFactor).add(offset));
+	});
+
+	// Create tear morph
+	var deltas = new DzMorphDeltas();
+	deltas = deltas.calculateDeltas(tearBase, tgtTear.getObject().getCachedGeom(), 0.001);
+	CreateMorph(tgtTear, deltas, vendor, product, outPath, morphName, srcMorph);
+}
+
+// Create morph for G8.1 target Tear attachment
+function CreateTearMorphG8(vendor, product, outPath, morphName, srcMorph)
+{
+	const scaleFactor = GetScaleFactor(tgt, tearRefVerts);
+
+	const tearMorphed = tgtTear.getObject().getCachedGeom(); // Tear base/morphed geometry (DzVertexMesh)
+
+	// Iterate tear vertices from map
+	Object.values(tearMap).forEach(([tgtIdx1, tgtIdx2, idx1, idx2, verts]) =>  // G8.1 vertex index 1 & 2, Tear vertex index edge loop
+	{
+		// Snap tear boundary loop to target
+		tearMorphed.setVertex(idx1, tgtMorphed.getVertex(tgtIdx1));
+		const tgtPos2 = tgtMorphed.getVertex(tgtIdx2); // Target (G8.1) vertex position
+		tearMorphed.setVertex(idx2, tgtPos2);
+
+		// Move remaining vertices in the loop with same magnitude
+		const offset = tgtPos2.subtract(tearBase.getVertex(idx2).multiply(scaleFactor)); // Vector to move tear vertex to target vertex
+		for (const i of verts)
+			tearMorphed.setVertex(i, tearMorphed.getVertex(i).multiply(scaleFactor).add(offset));
+	});
+
+	// Create morph
+	var deltas = new DzMorphDeltas();
+	deltas = deltas.calculateDeltas(tearBase, tgtTear.getObject().getCachedGeom(), 0.001);
+	CreateMorph(tgtTear, deltas, vendor, product, outPath, morphName, srcMorph);
+}
+
+// Create Eyelashes morph
+function CreateEyelashesMorph(vendor, product, outPath, morphName, srcMorph)
+{
+	const eyelashesMorphed = tgtEyelashes.getObject().getCachedGeom();
+	ApplyBaryMap(eyelashesMap, ['Genesis8Female', 'Genesis8Male', 'Genesis9'].includes(srcName.replace('_1', '')) ? srcEyelashes.getObject().getCachedGeom() : srcMorphed, ['Genesis8Female', 'Genesis8Male', 'Genesis9'].includes(tgtName.replace('_1', '')) ? eyelashesMorphed : tgtMorphed);
+
+	// Create Eyelashes morph
+	var deltas = new DzMorphDeltas();
+	deltas = deltas.calculateDeltas(eyelashesBase, eyelashesMorphed, 0.001);
+	CreateMorph(tgtEyelashes, deltas, vendor, product, outPath, morphName, srcMorph);
+}
+
+// Create Eyebrows morph
+function CreateEyebrowsMorph(vendor, product, outPath, morphName, srcMorph)
+{
+	const eyebrowsMorphed = tgtEyebrows.getObject().getCachedGeom();
+	ApplyBaryMap(eyebrowsMap, tgtMorphed, eyebrowsMorphed);
+
+	// Create Eyebrows morph
+	var deltas = new DzMorphDeltas();
+	deltas = deltas.calculateDeltas(eyebrowsBase, eyebrowsMorphed, 0.001);
+	CreateMorph(tgtEyebrows, deltas, vendor, product, outPath, morphName, srcMorph);
+}
+
+// Adjust target rigging to morphed shape
+function AdjustRiggingToShape(name)
+{
+	// Create & set
+	const adjuster = new DzShapeRiggingAdjuster();
+	adjuster.setFigure(tgt);
+//	if (!fullCharacter)
+		adjuster.setExcludedBones(GetBonesToExclude());
+	adjuster.setAdjustCenterPoints(true);
+	adjuster.setAdjustEndPoints(true);
+	adjuster.setAdjustOrientation(false);
+
+	// Execute
+	if (!adjuster.doAdjustments())
+		Report('\u2620 %1  |  Failed to adjust rigging to shape'.arg(name));
+}
+
+// ERC Freeze properties
+function ERCFreeze(prop, name)
+{
+	// 'Control Property Selection'
+	var freezer = new DzERCFreeze();
+	freezer.setControllerNode(tgt);
+	freezer.setControllerProperty(prop);
+
+	// Build the list of nodes with properties to freeze
+	var nodes = [tgt].concat(tgt.getAllBones());
+
+	for (const node of nodes) // Iterate over the nodes
+		freezer.addPropertiesToFreeze(node); // Add node's properties
+
+	// Discard insignificant values (below 0.001 threshold)
+	var props = freezer.getPropertiesToFreeze();
+	var newProps = [];
+
+	for (const p of props)
+		if (Math.abs(p.getValue()) > 0.001) // Discard insignificant values
+			newProps.push(p);
+
+	freezer.setPropertiesToFreeze(newProps);
+
+	// 'Keyed (Extract from Play Range)'
+	freezer.setKeyed(false);
+
+	// 'Additional Options' when the freeze is complete
+	freezer.setRestoreFigure(true);
+	freezer.setApplyController(true);
+	freezer.setRestoreRigging(true);
+
+	// Execute
+	if (!freezer.doFreeze())
+		Report('\u2620 %1  |  ERC freeze failure'.arg(name));
+}
+
+// Adjusting target rigging to shape messes eyes joints on target. Restore accurate target joint settings (Origin, Center Point & Orientation) from attachment figure bones
+function FixJoints(attachment, tgtBones)
+{
+	for (const tgtBone of tgtBones) // Target figure bone (to fix)
+	{
+		const bone = attachment.findNodeChild(tgtBone.name, true); // Attachment figure bone (accurate, intact after adjustment)
+
+		tgtBone.setOrigin(bone.getOrigin(true), true);
+		tgtBone.setEndPoint(bone.getEndPoint(true), true);
+		tgtBone.setOrientation(bone.getOrientation(true), true);
+	}
+}
+
+// Scale vertex
+function ScaleVertex(vertID, figure, boneName, geom, scaleFactor)
+{
+	const bonePos = figure.findNodeChild(boneName, true).getWSPos(); // DzNode
+	return geom.getVertex(vertID).subtract(bonePos).multiply(new DzVec3(scaleFactor, scaleFactor, scaleFactor)).add(bonePos); // Bone position + vertex direction vector scaled
+}
+
+// Rescale & relocate G8 target eyes
+function EyesRescaleRelocG8()
+{
+	const srcEyesMorphed = srcEyes.getObject().getCachedGeom(); // G9 Eyes
+	const [srcTop, srcBot, srcFront] = eyesVerticesSrc; // Unpack source reference vertices indices
+	const [tgtTop, tgtBot, tgtFront] = eyesVerticesTgt; // Unpack target reference vertices indices
+
+	//=============
+	// Apply source eyes scale to target eyes
+	//=============
+
+	// Current eyeball scale (infered from height)
+	const tgtHeight = tgtMorphed.getVertex(tgtTop).y - tgtMorphed.getVertex(tgtBot).y;
+	const srcHeight = srcEyesMorphed.getVertex(srcTop).y - srcEyesMorphed.getVertex(srcBot).y;
+
+	// New scale
+	const scaleFactor = srcHeight / tgtHeight;
+	const mat = new DzMatrix3(true);
+	mat.scale(scaleFactor);
+
+	//=============
+	// Reposition & rescale eyes
+	//=============
+	const morphedVert = ScaleVertex(tgtFront, tgt, 'lEye', tgtMorphed, scaleFactor).z; // Scaling doesn't update tgtMorphed, we need to compute manually new tgtFront vertex location
+	const srcBonePos = src.findNodeChild('l_eye', true).getWSPos(); // Source left eye bone position
+	const newZ = tgt.findNodeChild('lEye', true).getWSPos().z + (srcEyesMorphed.getVertex(srcFront).z - morphedVert); // Snap target fleshy front eye to source => current bone position + distance between source & target front vertices
+	const newPos = new DzVec3(srcBonePos.x, srcBonePos.y, newZ); // Snap target bones to source bones (with Z-offset supra)
+
+	for (var i = 0; i < 2; i++)
+	{
+		const bone = eyeBones[i]; // G8 eye bone (DzNode)
+		bone.setWSTransform(i === 0 ? newPos : newPos.multiply(VECTOR_RIGHT), bone.getWSRot(), mat);
+	}
+}
+
+// Rescale & relocate G9 eyes
+function EyesRescaleReloc()
+{
+	const tgtEyesMorphed = tgtEyes.getObject().getCachedGeom();
+	const [srcTop, srcBot, srcFront] = eyesVerticesSrc; // Unpack source reference vertices indices
+	const [tgtTop, tgtBot, tgtFront] = eyesVerticesTgt; // Unpack target reference vertices indices
+
+	//=============
+	// Apply source eyes scale to target eyes
+	//=============
+
+	// Current eyeball scale (infered from height)
+	const srcHeight = srcMorphed.getVertex(srcTop).y - srcMorphed.getVertex(srcBot).y;
+	const tgtHeight = tgtEyesMorphed.getVertex(tgtTop).y - tgtEyesMorphed.getVertex(tgtBot).y;
+
+	// Apply source eyes scale to target eyes
+	const mat = new DzMatrix3(true);
+	mat.scale(srcHeight / tgtHeight);
+
+	for (const eye of eyeBones) // G9 eye bone (DzNode)
+		eye.setLocalScale(mat);
+	tgtEyes.update();
+
+	//=============
+	// Reposition rescaled eyes
+	//=============
+	const srcBonePos = src.findNodeChild('lEye', true).getWSPos(); // Source left eye bone position (note: G1 to G8 have same naming)
+	const newZ = eyeBones[0].getWSPos().z + (srcMorphed.getVertex(srcFront).z - tgtEyesMorphed.getVertex(tgtFront).z) - 0.1; // Snap target fleshy front eye to source => current bone position + distance between source & target front vertices
+	const newPos = new DzVec3(srcBonePos.x, srcBonePos.y, newZ); // Snap target bones to source bones (with Z-offset supra)
+
+	for (var i = 0; i < 2; i++)
+	{
+		const eye = eyeBones[i]; // G9 eye bone (DzNode)
+		eye.setWSPos(i === 0 ? newPos : newPos.multiply(VECTOR_RIGHT));
+	}
+	tgtEyes.update();
+}
+
+// Store surface (material) vertices in a Set
+function GetSurfaceVerts(fig, surfaceNames, output)
+{
+	const geom = fig.getObject().getCurrentShape().getGeometry(); // Target base geometry
+	for (const name of surfaceNames)
+	{
+		const fg = geom.findMaterialGroup(name); // DzMaterialFaceGroup
+		for (const faceIdx of fg.toVector()) // Facet index
+		{
+			const face = geom.getFacet(faceIdx); // DzFacet
+			for (const vert of [face.vertIdx1, face.vertIdx2, face.vertIdx3, face.vertIdx4]) // Face vertex indices
+				output.add(vert);
+		}
+	}
+}
+
+// Rescale & reposition all mouth vertices (cavity, gums, teeth & tongue)
+function MouthRescaleRelocG8()
+{
+	// Get morphed source mouth relative scale vs base
+	const scaleFactor = GetScaleFactor(src, mouthRefVerts, true); // Mouth cavity scale factor
+
+	//===========
+	// Find vector to anchor point
+	//===========
+	const srcMP = VectorsMedian([srcMorphed.getVertex(srcMouthVerts[0]), srcMorphed.getVertex(srcMouthVerts[1])]); // Source mouth aperture median point
+	const tgtMP = VectorsMedian([tgtMorphed.getVertex(tgtMouthVerts[0]), tgtMorphed.getVertex(tgtMouthVerts[1])]); // Target mouth aperture median point (note : currently morphed = base)
+	const deltaPos = srcMP.subtract(tgtMP.multiply(scaleFactor));
+
+	//===========
+	// Rescale & reposition all mouth vertices (cavity, gums, teeth & tongue)
+	//===========
+	for (const idx of tgtJawVerts)
+	{
+		if (DEBUG && baryKeys.includes(String(idx)))
+			Report('Wrong', idx);
+		tgtMorphed.setVertex(idx, tgtMorphed.getVertex(idx).multiply(scaleFactor).add(deltaPos));
+	}
+}
+
+// Rescale & reposition mouth bones & mouth cavity vertices (G9 target)
+function MouthRescaleRelocG9()
+{
+	// Get morphed source mouth relative scale vs base
+	const scaleFactor = GetScaleFactor(src, mouthRefVerts, true); // Mouth cavity scale factor
+	const mat = new DzMatrix3(true);
+	mat.scale(scaleFactor);
+
+	// Find vector to anchor point
+	const srcMP = VectorsMedian([srcMorphed.getVertex(srcMouthVerts[0]), srcMorphed.getVertex(srcMouthVerts[1])]); // Source mouth aperture median point
+	const tgtMP = VectorsMedian([tgtMorphed.getVertex(tgtMouthVerts[0]), tgtMorphed.getVertex(tgtMouthVerts[1])]); // Target mouth aperture median point (note : currently morphed = base)
+	const deltaPos = srcMP.subtract(tgtMP.multiply(scaleFactor));
+
+	// Rescale & reposition target mouth bones
+	for (const bone of mouthBones) // G9 mouth bone (DzNode)
+	{
+		bone.getYPosControl().setIsClamped(false);
+		bone.getZPosControl().setIsClamped(false);
+		bone.setWSTransform(bone.getWSPos().multiply(scaleFactor).add(deltaPos), bone.getWSRot(), mat);
+	}
+	rootTongue.setInheritScale(true); // Propagate scaling to tongue
+
+	// Rescale & reposition mouth cavity vertices
+	for (const idx of mouthCavityVerts)
+	{
+		if (DEBUG && baryKeys.includes(String(idx)))
+			Report('Wrong', idx);
+		tgtMorphed.setVertex(idx, tgtMorphed.getVertex(idx).multiply(scaleFactor).add(deltaPos));
+	}
+}
+
+// Restore original asset info in morph file
+function RestoreAssetInfo(path, asset_info)
+{
+	const data = GetFileContent(path); // Get written morph data
+	asset_info.id = data.asset_info.id; // Overwrite 'id' in original asset info
+	data.asset_info = asset_info; // Overwrite asset info in written morph data
+
+	// Overwrite file
+	const file = compress.checked ? new DzGZFile(path) : new DzFile(path);
+	if (file.open(compress.checked ? DzGZFile.WriteOnly : DzFile.WriteOnly))
+		file.write(JSON.stringify(data, null, '\t'));
+}
+
+// Infer vendor & product names from source file path to set output path. Also store asset info
+function GetProductData(morph)
+{
+	const path = morph.assetSource.isEmpty() ? morph.assetUri.toPath() : morph.assetSource.toPath(); // Absolute file Path - Note: when the morph is in 'modified' state, assetUri is empty & assetSource is not empty (and vice-versa)
+	const [vendor, product] = GetVendorProduct(path);
+	const outPath = GetMorphPath(vendor, product);
+	const asset_info = GetFileContent(path).asset_info; // Store 'asset_info' in order to restore original asset info in the output file
+
+	return [vendor, product, outPath, asset_info];
+}
+
+// Save morph to dsf file
+function WriteMorph(node, mName, vendor, product, outPath, asset_info, morph)
+{
+	var classFilter = assetIOMgr.findFilter('DzMorphSupportAssetFilter');
+	var filter = assetIOMgr.getFilter(classFilter); // DzAssetIOFilter
+
+	// Settings
+	var settings = new DzFileIOSettings();
+	filter.getDefaultOptions(settings); // Default settings
+	settings.setStringValue('RootLabel', node.getLabel());
+	settings.setStringValue('BaseDataPath', contentLibrary);
+	settings.setStringValue('VendorName', vendor);
+	settings.setStringValue('ProductName', product);
+	settings.setBoolValue('CompressOutput', compress.checked);
+	settings.setBoolValue('RunSilent', true);
+	var subSetting = settings.setSettingsValue('NodeNames');
+	subSetting.setSettingsValue(node.getName()).setStringValue('0', mName);
+
+	// Save morph to dsf file
+	var error = assetIOMgr.doSaveWithOptions(filter, settings, '%1/%2'.arg(outPath).arg(mName));
+	var label = node.isRootNode() ? mName : node.getLabel();
+	if (error.valueOf() !== 0x00000000)
+		Report('\u2620 %1 Error while writing to file : %2'.arg(label).arg(getErrorMessage(error)));
+	else // Restore original asset info
+		RestoreAssetInfo(morph.assetUri.toPath(), asset_info);
+
+	filter.deleteLater();
+}
+
+// Copy source presentation card & icon
+function CopyCards(prop, srcProp)
+{
+	var presentation = srcProp.getPresentation(); // DzPresentation
+	var cards = [presentation.iconLarge, presentation.iconSmall]; // Relative path (uri)
+	for (const card of cards)
+	{
+		if (card.isEmpty())
+			continue;
+
+		var file = new DzFile(FullPathChecked(card)); // Source
+		var output = CardOutput(prop, card); // Destination
+
+		var success = file.copy(output);
+		if (!success) // Check if output file already exists
+			success = new DzFile(output).exists();
+		if (!success)
+			Report('\u2620 Failed to copy Card Image %1 : %2'.arg(name).arg(file.errorString()));
+	}
+}
+
+// Copy source characters icons to target
+function CopyCharactersIcons(icons, symlink = false)
+{
+	for (const icon of icons)
+	{
+		const [srcIcon, tgtIcon] = icon; // Unpack source & target icons file names
+
+		var srcFile = new DzFile(srcIcon); // Source
+		if (!srcFile.exists()) // Not all characters have a '.tip' icon
+			continue;
+
+		var dstFile = new DzFile(tgtIcon); // Destination (target)
+
+		// If destination file doesn't exist, create symlink or duplicate to destination
+		if (!(dstFile.exists() || symlink ? srcFile.link(dstFile) : srcFile.copy(tgtIcon)))
+			Report('\u2620 Failed to copy Image %1 : %2'.arg(srcIcon).arg(srcFile.errorString()));
+	}
+}
+
+// Get DzProperty absolute file path
+function GetPropPath(prop)
+{
+	var to_use = ToUse(prop); // Decide whether to use prop (controller) or morph
+	return to_use.assetSource.isEmpty() ? to_use.assetUri.toPath() : to_use.assetSource.toPath(); // Absolute file Path - Note: when the morph is in 'modified' state, assetUri is empty & assetSource is not empty (and vice-versa)
+}
+
+// Convert source card path to target path (where main newly created morph resides)
+function CardOutput(prop, card)
+{
+	var path = GetPropPath(prop);
+	var extension = card.split('.').slice(card.includes('.tip.') ? -2 : -1, ).join('.'); // Note : iconLarge can contain '.tip' before extension
+
+	return '%1.%2'.arg(path.split('.').slice(0, 1)).arg(extension);
+}
+
+// Create target controller property from source controller
+function CreateCTRL(ctrl)
+{
+	var name = ctrl.name;
+
+	if (DEBUG) Report('================ %1 =================='.arg(ctrl.getLabel()));
+
+	// Delete existing controller from target before creating a new one
+	var oldCtrl = helper.findPropertyOnNodeByInternalName(name, tgt);
+	if (oldCtrl)
+		helper.helperRemoveProperty(oldCtrl); // Delete cached property
+
+	// Restore target
+	RestoreTarget(); //ResetFigures();
+
+	// Infer vendor & product names from source file path to set output path. Also store asset info
+	const [vendor, product, outPath, asset_info] = GetProductData(ctrl);
+
+	// Create a new property
+	var prop = new DzFloatProperty(name, true, true); // 3rd parameter (isUserProperty) is set to true to make it deletable by user
+
+	TweakProperty(prop, ctrl, outPath);
+
+	// Add property to target
+	var error = tgt.addProperty(prop);
+	if (error.valueOf() !== 0x00000000)
+	{
+		Report('\u2620 %1  |  Error while adding controller to node : %2'.arg(name).arg(getErrorMessage(error)));
+		return;
+	}
+
+	// Set path & region - Note: must be called once property has been added to target
+	helper.setPropertyPath(prop, ctrl.getPath());
+
+	// ERC Freeze : virtually apply source controller to target (dial-in head & body morphs, apply transforms...) - TODO: maybe ignore scaling & handle skeleton discrepancies between figures
+	for (const slave of ctrl.getSlaveControllerList()) // Iterate 'Sub-Components' (DzController)
+	{
+		// If slave exists on target, create ERC link
+		var tgtProp = helper.findPropertyOnNodeByInternalName(ToUse(slave.getOwner()).name, tgt);
+		if (tgtProp)
+		{
+			if (tgtProp.inherits('DzMorph'))
+				tgtProp = tgtProp.getValueControl(); // DzFloatProperty
+
+			var link = new DzERCLink(slave.type, prop, slave.scalar, slave.addend); // Create link on prop (Sub-Component)
+			link.saveWithOutput = slave.saveWithOutput;
+			tgtProp.insertController(link); // Enslave target property (add link to Controllers)
+		}
+	}
+
+	// Save CTRL property as a morph asset
+	WriteMorph(tgt, name, vendor, product, outPath, asset_info, ctrl);
+
+	// Copy card & icon
+	if (dupliCards.checked) CopyCards(prop, ctrl);
+
+	// Log controller fully created
+	Report('\u2714 ' + ctrl.getLabel());
+}
+
+// Create character preset (silently)
+function CreateCharacter(fileName)
+{
+	// Set output path from source path
+	var outFN = ConvertToTarget(fileName);
+	outFN = contentLibrary + outFN.slice(outFN.indexOf('/People/')); // Replace source content library by desired output content library
+	var charName = outFN.split('/').pop().slice(0, -4); // Character name
+
+	var usable = false; // Whether at least one source property is found on target
+
+	// Open file & dial-in available modifiers
+	var file = new DzGZFile(fileName); // Open with DzGZFile, which is compression agnostic
+	if (file.open(DzGZFile.ReadOnly))
+	{
+		try
+		{
+			var data = JSON.parse(file.read());
+			for (const modifier of data.scene.modifiers)
+			{
+				// Skip no channel
+				if (!'channel' in modifier)
+					continue;
+
+				// If source modifier exists on target, apply it
+				var tgtProp = helper.findPropertyOnNodeByInternalName(modifier.id, tgt);
+				if (tgtProp)
+				{
+					ToUse(tgtProp).setValue(modifier.channel.value);
+					usable = true;
+				}
+			}
+		}
+		catch (e) { Report('\u2620 %1 : %2'.arg(e.message).arg(fileName)); }
+		finally { file.close(); }
+	}
+	else Report('\u2620 Error while opening ' + file.errorString());
+
+	if (!usable)
+	{
+		Report('\u2620 %1 Failed to create character'.arg(charName));
+		return;
+	}
+
+	// Get filter for character export
+	var idx = assetIOMgr.findFilter('DzCharacterAssetFilter');
+	var filter = assetIOMgr.getFilter(idx); // DzAssetIOFilter
+
+	// Settings
+	var settings = new DzFileIOSettings();
+	filter.getDefaultOptions(settings); // Default settings
+	settings.setBoolValue('WriteShapes', true);
+	settings.setBoolValue('WriteMaterials', true);
+	settings.setBoolValue('CompressOutput', compress.checked);
+	settings.setBoolValue('RunSilent', true);
+
+	// Post Load settings for attachments (eyelashes, tear, mouth, eyes & eyebrows) - TODO: should probably be automatic (left for later investigation)
+	var file = new DzFile('%1/Post Load Settings/%2.json'.arg(contentLibrary).arg(tgtName));
+	if (file.open(DzFile.ReadOnly)) // Get settings from json file for the figure
+	{
+		settings.setBoolValue('PostLoadEnable', true);
+		var subSettings = new DzSettings();
+		subSettings.fromString(file.read());
+		settings.setStringValue('PostLoadScriptPath', subSettings.getStringValue('PostLoadScriptPath'));
+		settings.setSettingsValue('PostLoadScriptSettings', subSettings.getSettingsValue('PostLoadScriptSettings'));
+		file.close();
+	}
+	else Report('\u2620 Failed to load Post Load settings ' + file.fileName());
+
+	//=================
+	// Save character preset to dsf file
+	//=================
+
+	// Create output directory
+	var dir = new DzDir(File2Path(outFN));
+	if (!dir.exists())
+		dir.mkdir();
+
+	// Save to file
+	var error = assetIOMgr.doSaveWithOptions(filter, settings, true, outFN); // Note : we don't save a viewport snapshot
+	if (error.valueOf() === 0x00000000)
+		Report('\u2714 ' + charName); // Success
+	else Report('\u2620 Failed to create character (%1)'.arg(getErrorMessage(error)));
+
+	filter.deleteLater();
+
+	// Restore target figure
+	RestoreTarget()
+
+	// On Windows, always duplicate icons. On other OS, duplicate icons if dupliCards is checked, create symlinks otherwise
+	CopyCharactersIcons([[fileName.replace('.duf', '.png'), outFN.replace('.duf', '.png')], [fileName.replace('.duf', '.tip.png'), outFN.replace('.duf', '.tip.png')]], App.platform() !== App.Windows && !dupliCards.checked);
+}
+
+
+//=================================================== MAIN FUNCTION ===================================================
+
+function MainFunction()
+{
+	tabs.setCurrentWidget(tab1); // Display Log Report tab
+
+//======================== 1) Process all morphs ===================================
+
+Report('===================>  Creating morphs  <===================');
+
+for (const item of transferLV.getItems(DzListView.Checked)) // Iterate checked items in the Transfer ListView
+{
+	const srcMorph = aMorphsArray[item.text(3)]; // DzProperty
+
+	// Skip controllers
+	if (!srcMorphs.includes(srcMorph))
+		continue;
+
+	if (DEBUG) Report('=========== Processing %1 ============='.arg(srcMorph.getLabel()));
+
+	isHead = srcMorph.getPath().startsWith('/Actor/Head'); // Check if we're processing a head or body morph. Inferred from source morph path region (Note: we can't rely on getRegion(), as region may be flawed)
+
+	const morphName = srcMorph.getOwner().name;
+
+	const [vendor, product, outPath, asset_info] = GetProductData(srcMorph.getOwner()); // Infer vendor & product names from source file path to set output path. Also store asset info
+
+	morphs = []; // Target morphs (main & attachments) [DzFloatProperty]
+	baryKeys = []; // Flush
+
+	// Delete existing morph from target & its attachments before creating a new one
+	RemoveMorphs(morphName);
+
+	//==================== Apply morph & pose controller to source figure ========================
+
+	ResetFigures();
+
+	srcMorph.setValue(1);
+
+	if (!(srcName.startsWith('Genesis8') && tgtName.startsWith('Genesis8'))) // G8F & G8M are in same pose
+		srcPose.setValue(1);
+
+	src.update();
+	sleep(1); // Ensure that attachments have enough time to update
+
+	//========================= Translate & scale source figure based on reference vertex Y =========================
+
+	srcMorphed = src.getObject().getCachedGeom(); // Source morphed geometry
+	tgtMorphed = tgt.getObject().getCachedGeom(); // Target base/morphed geometry
+
+	const rv1 = tgtBase.getVertex(refVertex).y; // Base reference vertex y
+	const rv2 = GetRefVertexMorphed(mainMap[refVertex]).y; // Morphed reference vertex y
+
+	// Rescale source figure
+	const scaleMat = new DzMatrix3(true);
+	scaleMat.scale(rv1 / rv2); // New scale based on offset
+
+	src.setWSScale(src.getWSScale().multiply(scaleMat)); // Apply offset to initial scale
+	Scene.update();
+
+	if (isHead)
+	{
+		const y2 = GetRefVertexMorphed(mainMap[refVertex]).y; // Morphed & rescaled reference vertex y
+		src.setWSPos(src.getWSPos().add(new DzVec3(0, rv1 - y2, 0))); // Translate source figure
+		Scene.update();
+	}
+
+	//===================================== Apply source morph to target using barycentric map =========================================
+
+	baryKeys = ApplyBaryMap(mainMap, srcMorphed, tgtMorphed);
+
+	//===================================== G9 target attachments =========================================
+
+	if (tgtName === 'Genesis9' && isHead)
+	{
+		// Scale & position Eyes
+		EyesRescaleReloc();
+
+		// Fix eye sockets globes
+		ApplyBaryMap(eyeSocketsGlobesMap, tgtEyes.getObject().getCachedGeom(), tgtMorphed);
+
+		// Fix eye sockets caruncle
+		ApplyBaryMap(caruncleMap, tgtMorphed, tgtMorphed, true);
+
+		// Scale & position mouth (figure & cavity)
+		MouthRescaleRelocG9();
+	}
+
+	//===================================== G8 target back of eyes =========================================
+
+	else if (tgtName.startsWith('Genesis8') && isHead) // G8 & G8.1
+	{
+		// Scale & position target eyes based on source Eyes figure
+		if (srcName === 'Genesis9')
+			EyesRescaleRelocG8(); // Scale & position Eyes
+
+		// Set back of eyes vertices not found in previous generations
+		for (const verts of tgtName.includes('Female') ? eyesBackVertsG8F : eyesBackVertsG8M)
+		{
+			const [top, middle, bottom] = verts; // G8 eyes back top, middle & bottom vertices (indices)
+			tgtMorphed.setVertex(middle, VectorsMedian([tgtMorphed.getVertex(top), tgtMorphed.getVertex(bottom)]));
+		}
+
+		// Scale & position mouth & fix eye sockets (except for G3 & G8, which shares similar geometry)
+		if (!(srcName.startsWith('Genesis3') || srcName.startsWith('Genesis8')))
+		{
+			ApplyBaryMap(caruncleMap, tgtMorphed, tgtMorphed, true); // Fix eye sockets //EyeSocketsG8();
+			MouthRescaleRelocG8();
+		}
+	}
+
+	//======================================= Create morphs =======================================
+
+	// Main morph
+	const deltas = CreateDeltas();
+	CreateMorph(tgt, deltas, vendor, product, outPath, morphName, srcMorph);
+
+	// Create attachments morphs
+	if (tgtName.startsWith('Genesis8') && isHead) // G8 & G8.1
+	{
+		if (tgtName.includes('_1')) // G8.1 has tear attachment (for G8, tear is part of (and mapped with) Eyelashes attachment, except for G9 source)
+			CreateTearMorphG8(vendor, product, outPath, morphName, srcMorph);
+		else if (srcName === 'Genesis9' || srcName.includes('_1'))
+			ApplyBaryMap(tearMap, tgtMorphed, tgtEyelashes.getObject().getCachedGeom(), true); // Note : morph will be created just below with eyelashes, which it belongs to)
+
+		CreateEyelashesMorph(vendor, product, outPath, morphName, srcMorph); // Eyelashes morph
+	}
+	else if (tgtName === 'Genesis9' && isHead) // G9
+	{
+		CreateTearMorph(vendor, product, outPath, morphName, srcMorph); // Tear morph
+		CreateEyelashesMorph(vendor, product, outPath, morphName, srcMorph); // Eyelashes morph
+		CreateEyebrowsMorph(vendor, product, outPath, morphName, srcMorph); // Eyebrows morph
+		CreateMorph(tgtEyes, null, vendor, product, outPath, morphName, srcMorph); // Eyes morph (no deltas)
+		CreateMorph(tgtMouth, null, vendor, product, outPath, morphName, srcMorph); // Mouth morph (no deltas)
+	}
+
+	// Dial-in new target morph
+	const tgtProp = morphs[0];
+	tgtProp.setValue(1);
+	tgt.select(true);
+
+//return;
+
+	//============================== Adjust rigging to shape (silently) ==============================
+
+	AdjustRiggingToShape(morphName);
+	tgt.update();
+
+	// Adjusting target rigging to shape messes joints on target. Restore accurate joint settings (Origin, Center Point & Orientation) from attachment figure
+	if (tgtName === 'Genesis9' && isHead)
+	{
+		FixJoints(tgtEyes, eyeBones);
+		FixJoints(tgtMouth, mouthBones);
+	}
+
+	//======================================= ERC Freeze (silently) =======================================
+
+	ERCFreeze(tgtProp, morphName);
+
+	//====================== Save as morph asset =========================
+
+	// Write morphs to file (main morph & attachments)
+	for (const prop of morphs)
+	{
+		var morph = prop.getOwner();
+		var node = morph.getElementParent().getElementParent(); // Morph node (morph < object < node)
+		WriteMorph(node, morphName, vendor, product, outPath, asset_info, morph);
+	}
+
+	// Unload source morph deltas
+	var morph = srcMorph.getOwner();
+	morph.getDeltas().unLoadDeltas();
+	morph.update();
+
+	//================== Copy card images to destination folder ==========================
+
+	// Copy card & icon
+	if (dupliCards.checked) CopyCards(tgtProp, srcMorph);
+
+	// Log morph fully created
+	Report('\u2714 %1 (%2)'.arg(srcMorph.getLabel()).arg(deltas ? deltas.getNumDeltas() : 'no'));
+
+} // End of step 1) Process all morphs
+
+//======================== 2) Process all controllers ===================================
+
+// Create controllers
+if (srcCtrls.length > 0) Report('\n===================>  Creating controllers  <===================');
+
+for (const item of transferLV.getItems(DzListView.Checked)) // Iterate checked items in the Transfer ListView
+{
+	var ctrl = aMorphsArray[item.text(3)]; // DzProperty
+
+	// If item is a source controller, create same controller on target
+	if (srcCtrls.includes(ctrl))
+		CreateCTRL(ctrl);
+}
+
+//======================== 3) Process all characters ===================================
+
+if (doCharacters.checked)
+{
+	Report('\n==============>  Creating Character Presets  <==============');
+
+	// Get source character presets
+	if (srcCharacters.length === 0)
+		GetCharacters();
+
+	// Create new character preset from source preset
+	for (const fileName of srcCharacters)
+		CreateCharacter(fileName);
+}
+
+// Final reset
+ResetFigures();
+tgt.select(true);
+
+// Display Morph Slider
+row4.show();
+
+// Final message
+MessageBox.information('\nAll tasks completed !\n\nCheck log for potential failures', 'Done !', 'OK');
+
+} // End of MainFunction()
+
+window.exec(); })(); }
+
+catch(e)
+{
+	// Ensure that MessageBox is available (requires 'Customize Interface' plugin)
+	if (typeof MessageBox === 'undefined')
+		print("[\u2620 Fatal Error] To use this tool the 'Customize Interface' plugin must be enabled");
+
+	// Note: if MessageBox is not available, call to MessageBox below triggers an error inviting the user to check his log
+	MessageBox.critical('Runtime Error: ' + e.message, '\u2620 Fatal Error', 'Exit');
+}
