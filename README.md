@@ -10,7 +10,7 @@
 ## Table of Contents
 
 - [Features](#features)
-- [Supported source & target figures](#supported-source-target-figures)
+- [Supported source & target figures](#supported-source-and-target-figures)
 - [Installation](#installation)
     - [1) First install](#1-first-install)
 	- [2) Updating existing install](#2-updating-existing-install)
@@ -50,7 +50,7 @@
 | **No attachment morphs for Body morphs** | ✅ |  |
 | **Unload deltas after use** | ✅ |  |
 
-## Supported source & target figures
+## Supported source and target figures
 
 | Source / Target | G8F | G8F.1 | G8M | G8M.1 | G9 |
 |:-:|:-:|:-:|:-:|:-:|:-:|
